@@ -29,18 +29,31 @@ if (!TANDOOR_API_TOKEN) {
 
 // --- Tandoor API Types (Simplified) ---
 interface TandoorFoodInput {
+  id?: number;
   name: string;
 }
 
 interface TandoorUnitInput {
+  id?: number;
   name: string;
 }
 
 interface TandoorIngredientInput {
-  food: TandoorFoodInput;
-  unit: TandoorUnitInput;
-  amount: string; // Tandoor API expects string for amount
+  food: TandoorFoodInput | null;
+  unit?: TandoorUnitInput; // omitted entirely when the line named no unit
+  amount: number;
   note?: string;
+}
+
+// One entry of IngredientParserResponse.ingredients
+// (POST /api/ingredient-parser/post/). food and unit are resolved against the
+// space's existing records, so they come back with real ids.
+interface TandoorParsedIngredient {
+  food: TandoorFoodInput | null;
+  unit: TandoorUnitInput | null;
+  amount: number;
+  note?: string | null;
+  original_text?: string | null;
 }
 
 interface TandoorStepInput {
@@ -305,17 +318,67 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           throw new McpError(ErrorCode.InvalidParams, "Missing required arguments: name, ingredients_block, instructions_block.");
         }
 
-        // Basic parsing: each line is an ingredient, use line as food name, placeholder unit/amount
-        const ingredients: TandoorIngredientInput[] = ingredients_block
+        // Ingredient parsing is delegated to Tandoor's own parser
+        // (POST /api/ingredient-parser/post/). It resolves the amount including
+        // fractions ("1/2", "\u00bd") and ranges, matches the unit against the
+        // space's existing units, splits a trailing ", note" off the food name,
+        // and applies the space's food/unit automation rules. The previous
+        // implementation sent the entire line as the food name with a hardcoded
+        // amount of 1 and a unit literally named "unit" — that is what produced
+        // the malformed Food and Unit records this replaces.
+        const ingredientLines = ingredients_block
           .split('\n')
           .map(line => line.trim())
-          .filter(line => line.length > 0)
-          .map(line => ({
-            food: { name: line }, // Use the line as the food name
-            unit: { name: "unit" }, // Placeholder unit
-            amount: "1", // Placeholder amount
-            note: line // Store original line in note for reference? API might ignore.
-          }));
+          .filter(line => line.length > 0);
+
+        if (ingredientLines.length === 0) {
+          throw new McpError(ErrorCode.InvalidParams, "ingredients_block contained no non-empty lines.");
+        }
+
+        console.error(`[API] POST /api/ingredient-parser/post/ - Parsing ${ingredientLines.length} ingredient line(s)`);
+        let parsedIngredients: TandoorParsedIngredient[];
+        try {
+          const parseResponse = await apiClient.post('/api/ingredient-parser/post/', { ingredients: ingredientLines });
+          console.error(`[API] POST /api/ingredient-parser/post/ - Status: ${parseResponse.status}`);
+          parsedIngredients = parseResponse.data?.ingredients || [];
+        } catch (err: any) {
+          console.error(`[Error] Failed to parse ingredients:`, err);
+          const errorDetail = err.response?.data ? JSON.stringify(err.response.data) : 'No response data';
+          throw new McpError(ErrorCode.InternalError, `Failed to parse ingredients: ${err.message} - API Response: ${errorDetail}`);
+        }
+
+        // Refuse to build a recipe out of a partial parse rather than silently
+        // dropping or misaligning ingredients.
+        if (parsedIngredients.length !== ingredientLines.length) {
+          throw new McpError(
+            ErrorCode.InternalError,
+            `Ingredient parser returned ${parsedIngredients.length} result(s) for ${ingredientLines.length} line(s); refusing to create a recipe with mismatched ingredients.`
+          );
+        }
+
+        const ingredients: TandoorIngredientInput[] = parsedIngredients.map((parsed) => {
+          const ingredient: TandoorIngredientInput = {
+            // Never fall back to the raw line. A null food is real data (a line
+            // that parses to nothing but a note); a line-as-food-name is not.
+            food: parsed.food ? { id: parsed.food.id, name: parsed.food.name } : null,
+            // Tandoor represents "no amount given" as 0 and Ingredient.amount is
+            // non-nullable, so pass the parser's value straight through rather
+            // than defaulting to 1.
+            amount: parsed.amount ?? 0,
+          };
+          // Omit unit entirely when the line named none — a missing unit is
+          // correct data, a fabricated one is not.
+          if (parsed.unit) {
+            ingredient.unit = { id: parsed.unit.id, name: parsed.unit.name };
+          }
+          const note = parsed.note?.trim();
+          if (note) {
+            ingredient.note = note;
+          }
+          return ingredient;
+        });
+
+        console.error(`[Info] Parsed ${ingredients.length} ingredient(s): ${ingredients.map(i => `${i.amount} ${i.unit?.name ?? ''} ${i.food?.name ?? '?'}`.replace(/\s+/g, ' ').trim()).join(' | ')}`);
 
         const recipePayload: TandoorRecipeInput = {
           name: name,
@@ -363,9 +426,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         // 1. Find Meal Type ID
         console.error(`[API] GET /api/meal-type/ - Fetching meal types`);
-        const mealTypesResponse = await apiClient.get<TandoorMealType[]>('/api/meal-type/');
+        const mealTypesResponse = await apiClient.get('/api/meal-type/');
         console.error(`[API] GET /api/meal-type/ - Status: ${mealTypesResponse.status}, Data: ${JSON.stringify(mealTypesResponse.data)}`); // Log received data
-        const mealType = mealTypesResponse.data.find(mt => mt.name.toLowerCase() === mealTypeName.toLowerCase());
+        const availableMealTypes: TandoorMealType[] = mealTypesResponse.data.results || mealTypesResponse.data || []; // Handle paginated and non-paginated
+        const mealType = availableMealTypes.find(mt => mt.name.toLowerCase() === mealTypeName.toLowerCase());
 
         if (!mealType) {
             console.error(`[Error] Meal type "${mealTypeName}" not found in received data.`); // More specific log
@@ -586,7 +650,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           const response = await apiClient.get(url);
           console.error(`[API] GET ${url} - Status: ${response.status}`);
           
-          const mealPlans = response.data || [];
+          const mealPlans = response.data.results || response.data || []; // Handle paginated and non-paginated
           
           // Format the results
           const formattedMealPlans = mealPlans.map((plan: any) => ({
@@ -645,7 +709,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         try {
           const response = await apiClient.get(url);
           console.error(`[API] GET ${url} - Status: ${response.status}`);
-          const mealTypes = response.data || [];
+          const mealTypes = response.data.results || response.data || []; // Handle paginated and non-paginated
           const resultText = mealTypes.length > 0
             ? `Available Meal Types:\n${mealTypes.map((mt: any) => `ID: ${mt.id} - Name: ${mt.name}`).join('\n')}`
             : 'No meal types found.';
@@ -752,7 +816,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         try {
           const response = await apiClient.get(url);
           console.error(`[API] GET ${url} - Status: ${response.status}`);
-          const items = response.data || [];
+          const items = response.data.results || response.data || []; // Handle paginated and non-paginated
           const resultText = items.length > 0
             ? `Shopping List Items (${checked}):\n${items.map((item: any) => 
                 `ID: ${item.id} - ${item.amount} ${item.unit?.name || '?'} ${item.food?.name || '?'} ${item.checked ? '[Checked]' : ''}${item.note ? ' (Note: ' + item.note + ')' : ''}`
