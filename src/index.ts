@@ -9,6 +9,8 @@ import {
   ErrorCode,
 } from "@modelcontextprotocol/sdk/types.js";
 import axios, { AxiosInstance } from 'axios';
+import { readFile } from 'node:fs/promises';
+import { basename, extname } from 'node:path';
 
 // --- Configuration ---
 const TANDOOR_URL = process.env.TANDOOR_URL;
@@ -105,6 +107,73 @@ const apiClient: AxiosInstance = axios.create({
   }
 });
 
+// Separate client for PUT /api/recipe/{id}/image/. That endpoint declares
+// parser_classes=[MultiPartParser] and accepts multipart/form-data ONLY, but
+// apiClient above sets 'Content-Type: application/json' on every request — and
+// axios, seeing a JSON content type, serialises a FormData body to JSON rather
+// than streaming it. Tandoor then answers with an opaque 400 that reads like a
+// validation error but is really a content-type mismatch. This client simply
+// omits the content type so axios emits a real multipart body with a boundary.
+const uploadClient: AxiosInstance = axios.create({
+  baseURL: TANDOOR_URL,
+  headers: {
+    'Authorization': `Bearer ${TANDOOR_API_TOKEN}`,
+    'Accept': 'application/json',
+  }
+});
+
+// --- Helpers shared by the write tools ---
+
+function requireArgs(args: unknown): Record<string, any> {
+  if (!args || typeof args !== 'object' || args === null) {
+    throw new McpError(ErrorCode.InvalidParams, "Invalid arguments object.");
+  }
+  return args as Record<string, any>;
+}
+
+function requireNumber(args: Record<string, any>, key: string): number {
+  if (typeof args[key] !== 'number') {
+    throw new McpError(ErrorCode.InvalidParams, `Missing or invalid required argument: ${key} (number).`);
+  }
+  return args[key] as number;
+}
+
+function requireString(args: Record<string, any>, key: string): string {
+  const value = args[key];
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    throw new McpError(ErrorCode.InvalidParams, `Missing or invalid required argument: ${key} (non-empty string).`);
+  }
+  return value;
+}
+
+// Collect only the fields the caller actually supplied, so a PATCH never blanks
+// a field that simply went unmentioned.
+function collectOptional(args: Record<string, any>, keys: string[]): Record<string, any> {
+  const payload: Record<string, any> = {};
+  for (const key of keys) {
+    if (args[key] !== undefined) payload[key] = args[key];
+  }
+  return payload;
+}
+
+// Mirrors the error shape used by add_shopping_list_item: surface Tandoor's own
+// response body, which is where the useful validation detail lives.
+function apiError(action: string, err: any): McpError {
+  const errorDetail = err.response?.data ? JSON.stringify(err.response.data) : 'No response data';
+  return new McpError(ErrorCode.InternalError, `${action}: ${err.message} - API Response: ${errorDetail}`);
+}
+
+const IMAGE_MIME_TYPES: Record<string, string> = {
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.png': 'image/png',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.bmp': 'image/bmp',
+  '.tif': 'image/tiff',
+  '.tiff': 'image/tiff',
+};
+
 // --- MCP Server Setup ---
 const server = new Server(
   {
@@ -170,6 +239,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             keywords: { type: "array", items: { type: "integer" }, description: "Array of Keyword IDs (match ANY)." },
             foods: { type: "array", items: { type: "integer" }, description: "Array of Food IDs (match ANY)." },
             rating: { type: "integer", minimum: 0, maximum: 5, description: "Minimum rating (0-5)." },
+            has_image: { type: "boolean", description: "Filter to recipes that have (true) or lack (false) an image. Tandoor exposes no server-side filter for this, so it is applied client-side to the page fetched — raise 'limit' if you are sweeping the whole collection." },
             limit: { type: "integer", description: "Max number of recipes to return (default: 10).", default: 10 }
           },
           required: []
@@ -291,6 +361,234 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             item_id: { type: "integer", description: "The ID of the shopping list item to remove." }
           },
           required: ["item_id"]
+        },
+      },
+      // --- Write tools: keywords ---
+      {
+        name: "create_keyword",
+        description: "Create a keyword (tag). Optionally nest it under a parent keyword so hierarchies like 'tier/', 'role/' and 'constraint/' can be built as a tree.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            name: { type: "string", description: "The keyword name." },
+            description: { type: "string", description: "Optional description." },
+            parent: { type: "integer", description: "Optional ID of the parent keyword. Tandoor's API does not accept a parent on create, so the keyword is created first and then moved under the parent." }
+          },
+          required: ["name"]
+        },
+      },
+      {
+        name: "update_keyword",
+        description: "Update an existing keyword's name or description.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            keyword_id: { type: "integer", description: "The ID of the keyword to update." },
+            name: { type: "string", description: "Optional new name." },
+            description: { type: "string", description: "Optional new description." }
+          },
+          required: ["keyword_id"]
+        },
+      },
+      {
+        name: "delete_keyword",
+        description: "Delete a keyword. This removes the tag from every recipe that carries it; the recipes themselves are not deleted.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            keyword_id: { type: "integer", description: "The ID of the keyword to delete." }
+          },
+          required: ["keyword_id"]
+        },
+      },
+      // --- Write tools: meal types ---
+      {
+        name: "create_meal_type",
+        description: "Create a meal type (e.g. 'Breakfast', 'Dinner'). Meal plan entries require an existing meal type.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            name: { type: "string", description: "The meal type name." },
+            order: { type: "integer", description: "Optional display order (lower sorts first)." }
+          },
+          required: ["name"]
+        },
+      },
+      // --- Write tools: recipes ---
+      {
+        name: "update_recipe",
+        description: "Update an existing recipe in place (PATCH). Only the fields supplied are changed. Supplying 'keywords' REPLACES the recipe's entire keyword list with the IDs given, so pass the full desired set, not just additions.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            recipe_id: { type: "integer", description: "The ID of the recipe to update." },
+            name: { type: "string", description: "Optional new name." },
+            description: { type: "string", description: "Optional new description." },
+            servings: { type: "number", description: "Optional new number of servings." },
+            servings_text: { type: "string", description: "Optional text describing what a serving is (e.g. 'portions')." },
+            keywords: { type: "array", items: { type: "integer" }, description: "Optional array of keyword IDs. REPLACES the existing keyword list." },
+            working_time: { type: "integer", description: "Optional active preparation time in minutes." },
+            waiting_time: { type: "integer", description: "Optional passive/waiting time in minutes." },
+            source_url: { type: "string", description: "Optional source URL." }
+          },
+          required: ["recipe_id"]
+        },
+      },
+      {
+        name: "delete_recipe",
+        description: "Permanently delete a recipe and its steps and ingredients. This cannot be undone.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            recipe_id: { type: "integer", description: "The ID of the recipe to delete." }
+          },
+          required: ["recipe_id"]
+        },
+      },
+      {
+        name: "set_recipe_image",
+        description: "Set a recipe's image. Provide EXACTLY ONE of file_path (a local image file, uploaded as multipart/form-data) or image_url. Note that image_url is fetched by the Tandoor server itself through its SSRF guard, which refuses private/LAN addresses — use it only for public URLs, and prefer file_path. Tandoor silently swallows image errors and still answers 200, so this tool re-reads the recipe afterwards and reports an error if no image actually attached.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            recipe_id: { type: "integer", description: "The ID of the recipe." },
+            file_path: { type: "string", description: "Path to a local image file to upload." },
+            image_url: { type: "string", description: "Public URL for Tandoor to fetch. Private/LAN addresses are refused by Tandoor's SSRF guard." }
+          },
+          required: ["recipe_id"]
+        },
+      },
+      {
+        name: "clear_recipe_image",
+        description: "Remove a recipe's image. Tandoor has no DELETE for this; the image is cleared by sending the image endpoint neither a file nor a URL.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            recipe_id: { type: "integer", description: "The ID of the recipe." }
+          },
+          required: ["recipe_id"]
+        },
+      },
+      // --- Write tools: foods ---
+      {
+        name: "create_food",
+        description: "Create a food. Optionally nest it under a parent food.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            name: { type: "string", description: "The food name." },
+            plural_name: { type: "string", description: "Optional plural name." },
+            description: { type: "string", description: "Optional description." },
+            parent: { type: "integer", description: "Optional ID of the parent food. Tandoor's API does not accept a parent on create, so the food is created first and then moved under the parent." }
+          },
+          required: ["name"]
+        },
+      },
+      {
+        name: "update_food",
+        description: "Update an existing food's name, plural name or description.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            food_id: { type: "integer", description: "The ID of the food to update." },
+            name: { type: "string", description: "Optional new name." },
+            plural_name: { type: "string", description: "Optional new plural name." },
+            description: { type: "string", description: "Optional new description." }
+          },
+          required: ["food_id"]
+        },
+      },
+      {
+        name: "merge_food",
+        description: "Merge one food into another: every ingredient referencing the source food is repointed at the target, and the source food is deleted. Used to collapse duplicate or malformed food records. This cannot be undone.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            food_id: { type: "integer", description: "The ID of the source food, which will be deleted." },
+            target_food_id: { type: "integer", description: "The ID of the target food to keep." }
+          },
+          required: ["food_id", "target_food_id"]
+        },
+      },
+      // --- Write tools: units ---
+      {
+        name: "create_unit",
+        description: "Create a unit of measure (e.g. 'g', 'cup', 'tbsp').",
+        inputSchema: {
+          type: "object",
+          properties: {
+            name: { type: "string", description: "The unit name." },
+            plural_name: { type: "string", description: "Optional plural name." },
+            description: { type: "string", description: "Optional description." },
+            base_unit: { type: "string", description: "Optional base unit for conversions." }
+          },
+          required: ["name"]
+        },
+      },
+      {
+        name: "update_unit",
+        description: "Update an existing unit's name, plural name, description or base unit.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            unit_id: { type: "integer", description: "The ID of the unit to update." },
+            name: { type: "string", description: "Optional new name." },
+            plural_name: { type: "string", description: "Optional new plural name." },
+            description: { type: "string", description: "Optional new description." },
+            base_unit: { type: "string", description: "Optional new base unit." }
+          },
+          required: ["unit_id"]
+        },
+      },
+      // --- Write tools: supermarkets ---
+      {
+        name: "create_supermarket",
+        description: "Create a supermarket, used to order the shopping list by aisle.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            name: { type: "string", description: "The supermarket name." },
+            description: { type: "string", description: "Optional description." }
+          },
+          required: ["name"]
+        },
+      },
+      {
+        name: "create_supermarket_category",
+        description: "Create a supermarket category (an aisle/section) that foods can be assigned to.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            name: { type: "string", description: "The category name." },
+            description: { type: "string", description: "Optional description." }
+          },
+          required: ["name"]
+        },
+      },
+      // --- Write tools: meal plan / shopping list ---
+      {
+        name: "delete_meal_plan_entry",
+        description: "Delete a single meal plan entry. This removes the planned meal, not the recipe.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            meal_plan_id: { type: "integer", description: "The ID of the meal plan entry to delete." }
+          },
+          required: ["meal_plan_id"]
+        },
+      },
+      {
+        name: "add_recipe_to_shopping_list",
+        description: "Add a recipe's ingredients to the shopping list, merging with what is already there. Omit ingredient_ids to add every ingredient in the recipe.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            recipe_id: { type: "integer", description: "The ID of the recipe to add." },
+            servings: { type: "integer", description: "Optional servings to scale to (default 1)." },
+            ingredient_ids: { type: "array", items: { type: "integer" }, description: "Optional array of ingredient IDs from this recipe. If omitted, all ingredients are added." },
+            list_recipe: { type: "integer", description: "Optional ID of an existing shopping-list-recipe entry to update instead of creating a new one." }
+          },
+          required: ["recipe_id"]
         },
       }
     ],
@@ -540,6 +838,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const keywords = args.keywords as number[] | undefined;
         const foods = args.foods as number[] | undefined;
         const rating = args.rating as number | undefined;
+        const hasImage = args.has_image as boolean | undefined;
         const limit = args.limit as number || 10; // Default to 10 if not provided
         
         // Construct query parameters
@@ -578,9 +877,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           const response = await apiClient.get(url);
           console.error(`[API] GET ${url} - Status: ${response.status}`);
           
-          const recipes = response.data.results || [];
           const count = response.data.count || 0;
-          
+          let recipes = response.data.results || [];
+          const fetchedCount = recipes.length;
+
+          // Tandoor's recipe list endpoint exposes no has_image filter, so it is
+          // applied here over the page that was fetched. RecipeOverview already
+          // carries the image field, so this needs no per-recipe detail fetch.
+          if (hasImage !== undefined) {
+            recipes = recipes.filter((recipe: any) => Boolean(recipe.image) === hasImage);
+          }
+
           // Format the results
           const formattedRecipes = recipes.map((recipe: any) => ({
             id: recipe.id,
@@ -588,14 +895,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             description: recipe.description || '',
             rating: recipe.rating || 'Not rated',
             servings: recipe.servings || 0,
+            image: recipe.image || null,
             keywords: (recipe.keywords || []).map((k: any) => ({ id: k.id, name: k.label }))
           }));
-          
+
+          const scopeNote = hasImage === undefined
+            ? `Found ${count} recipes (showing ${formattedRecipes.length})`
+            : `Found ${count} recipes; ${formattedRecipes.length} of the ${fetchedCount} fetched ${hasImage ? 'have' : 'lack'} an image (showing those)`;
+
           const resultText = formattedRecipes.length > 0
-            ? `Found ${count} recipes (showing ${formattedRecipes.length}):\n\n${formattedRecipes.map((r: { id: number; name: string; description: string; rating: string }) => 
-                `ID: ${r.id} - ${r.name}${r.description ? '\nDescription: ' + r.description : ''}${r.rating ? '\nRating: ' + r.rating : ''}`
+            ? `${scopeNote}:\n\n${formattedRecipes.map((r: { id: number; name: string; description: string; rating: string; image: string | null }) => 
+                `ID: ${r.id} - ${r.name}${r.description ? '\nDescription: ' + r.description : ''}${r.rating ? '\nRating: ' + r.rating : ''}\nImage: ${r.image || 'none'}`
               ).join('\n\n')}`
-            : 'No recipes found matching the criteria.';
+            : (hasImage === undefined
+                ? 'No recipes found matching the criteria.'
+                : `No recipes found matching the criteria (with has_image=${hasImage}).`);
             
           return { content: [{ type: "text", text: resultText }] };
         } catch (err: any) {
@@ -988,6 +1302,516 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
              throw new McpError(ErrorCode.InvalidParams, `Shopping list item with ID ${itemId} not found.`);
           }
           throw new McpError(ErrorCode.InternalError, `Failed to remove shopping list item: ${err.message} - API Response: ${errorDetail}`);
+        }
+      }
+
+      // --- create_keyword ---
+      case "create_keyword": {
+        const args = requireArgs(request.params.arguments);
+        const name = requireString(args, 'name');
+        const parent = args.parent as number | undefined;
+
+        // Keyword.parent is read-only on the serializer, so it cannot be set in
+        // the POST body. Tandoor's own UI creates the keyword first and then
+        // moves it: PUT /api/keyword/{id}/move/{parent}/.
+        const payload = { name, ...collectOptional(args, ['description']) };
+        console.error(`[API] POST /api/keyword/ - Payload: ${JSON.stringify(payload)}`);
+        let keyword: any;
+        try {
+          const response = await apiClient.post('/api/keyword/', payload);
+          console.error(`[API] POST /api/keyword/ - Status: ${response.status}`);
+          keyword = response.data;
+        } catch (err: any) {
+          console.error(`[Error] Failed to create keyword "${name}":`, err);
+          throw apiError(`Failed to create keyword "${name}"`, err);
+        }
+
+        let parentNote = '';
+        if (parent !== undefined) {
+          const moveUrl = `/api/keyword/${keyword.id}/move/${parent}/`;
+          console.error(`[API] PUT ${moveUrl} - Moving keyword under parent`);
+          try {
+            const moveResponse = await apiClient.put(moveUrl, {});
+            console.error(`[API] PUT ${moveUrl} - Status: ${moveResponse.status}`);
+            parentNote = ` and moved under parent keyword ID ${parent}`;
+          } catch (err: any) {
+            console.error(`[Error] Failed to move keyword ${keyword.id} under parent ${parent}:`, err);
+            throw apiError(`Created keyword ID ${keyword.id} but failed to move it under parent ${parent}`, err);
+          }
+        }
+
+        const successMsg = `Successfully created keyword "${keyword.name}" (ID: ${keyword.id})${parentNote}.`;
+        console.error(`[Info] ${successMsg}`);
+        return { content: [{ type: "text", text: successMsg }] };
+      }
+
+      // --- update_keyword ---
+      case "update_keyword": {
+        const args = requireArgs(request.params.arguments);
+        const keywordId = requireNumber(args, 'keyword_id');
+        const payload = collectOptional(args, ['name', 'description']);
+
+        if (Object.keys(payload).length === 0) {
+          throw new McpError(ErrorCode.InvalidParams, "No fields provided to update.");
+        }
+
+        const url = `/api/keyword/${keywordId}/`;
+        console.error(`[API] PATCH ${url} - Payload: ${JSON.stringify(payload)}`);
+        try {
+          const response = await apiClient.patch(url, payload);
+          console.error(`[API] PATCH ${url} - Status: ${response.status}`);
+          const successMsg = `Successfully updated keyword ID ${keywordId} (name: "${response.data.name}").`;
+          return { content: [{ type: "text", text: successMsg }] };
+        } catch (err: any) {
+          console.error(`[Error] Failed to update keyword ${keywordId}:`, err);
+          if (axios.isAxiosError(err) && err.response?.status === 404) {
+            throw new McpError(ErrorCode.InvalidParams, `Keyword with ID ${keywordId} not found.`);
+          }
+          throw apiError(`Failed to update keyword ID ${keywordId}`, err);
+        }
+      }
+
+      // --- delete_keyword ---
+      case "delete_keyword": {
+        const args = requireArgs(request.params.arguments);
+        const keywordId = requireNumber(args, 'keyword_id');
+
+        const url = `/api/keyword/${keywordId}/`;
+        console.error(`[API] DELETE ${url}`);
+        try {
+          const response = await apiClient.delete(url);
+          console.error(`[API] DELETE ${url} - Status: ${response.status}`);
+          return { content: [{ type: "text", text: `Successfully deleted keyword ID ${keywordId}.` }] };
+        } catch (err: any) {
+          console.error(`[Error] Failed to delete keyword ${keywordId}:`, err);
+          if (axios.isAxiosError(err) && err.response?.status === 404) {
+            throw new McpError(ErrorCode.InvalidParams, `Keyword with ID ${keywordId} not found.`);
+          }
+          throw apiError(`Failed to delete keyword ID ${keywordId}`, err);
+        }
+      }
+
+      // --- create_meal_type ---
+      case "create_meal_type": {
+        const args = requireArgs(request.params.arguments);
+        const name = requireString(args, 'name');
+        const payload = { name, ...collectOptional(args, ['order']) };
+
+        console.error(`[API] POST /api/meal-type/ - Payload: ${JSON.stringify(payload)}`);
+        try {
+          const response = await apiClient.post('/api/meal-type/', payload);
+          console.error(`[API] POST /api/meal-type/ - Status: ${response.status}`);
+          const successMsg = `Successfully created meal type "${response.data.name}" (ID: ${response.data.id}).`;
+          console.error(`[Info] ${successMsg}`);
+          return { content: [{ type: "text", text: successMsg }] };
+        } catch (err: any) {
+          console.error(`[Error] Failed to create meal type "${name}":`, err);
+          throw apiError(`Failed to create meal type "${name}"`, err);
+        }
+      }
+
+      // --- update_recipe ---
+      case "update_recipe": {
+        const args = requireArgs(request.params.arguments);
+        const recipeId = requireNumber(args, 'recipe_id');
+        const keywordIds = args.keywords as number[] | undefined;
+
+        const payload: Record<string, any> = collectOptional(args, [
+          'name', 'description', 'servings', 'servings_text', 'working_time', 'waiting_time', 'source_url',
+        ]);
+
+        // PatchedRecipe.keywords is an array of Keyword OBJECTS, not IDs, so the
+        // supplied IDs are resolved to full records first. Sending this field
+        // replaces the recipe's whole keyword list.
+        if (keywordIds !== undefined) {
+          if (!Array.isArray(keywordIds)) {
+            throw new McpError(ErrorCode.InvalidParams, "keywords must be an array of keyword IDs.");
+          }
+          const resolved: any[] = [];
+          for (const keywordId of keywordIds) {
+            console.error(`[API] GET /api/keyword/${keywordId}/ - Resolving keyword for recipe update`);
+            try {
+              const keywordResponse = await apiClient.get(`/api/keyword/${keywordId}/`);
+              resolved.push(keywordResponse.data);
+            } catch (err: any) {
+              console.error(`[Error] Failed to resolve keyword ${keywordId}:`, err);
+              if (axios.isAxiosError(err) && err.response?.status === 404) {
+                throw new McpError(ErrorCode.InvalidParams, `Keyword with ID ${keywordId} not found.`);
+              }
+              throw apiError(`Failed to resolve keyword ID ${keywordId}`, err);
+            }
+          }
+          payload.keywords = resolved;
+        }
+
+        if (Object.keys(payload).length === 0) {
+          throw new McpError(ErrorCode.InvalidParams, "No fields provided to update.");
+        }
+
+        const url = `/api/recipe/${recipeId}/`;
+        console.error(`[API] PATCH ${url} - Payload: ${JSON.stringify(payload)}`);
+        try {
+          const response = await apiClient.patch(url, payload);
+          console.error(`[API] PATCH ${url} - Status: ${response.status}`);
+          const appliedKeywords = (response.data.keywords || []).map((k: any) => k.name).join(', ');
+          const successMsg = `Successfully updated recipe "${response.data.name}" (ID: ${recipeId}). Fields changed: ${Object.keys(payload).join(', ')}.${payload.keywords ? ` Keywords now: ${appliedKeywords || '(none)'}.` : ''}`;
+          console.error(`[Info] ${successMsg}`);
+          return { content: [{ type: "text", text: successMsg }] };
+        } catch (err: any) {
+          console.error(`[Error] Failed to update recipe ${recipeId}:`, err);
+          if (axios.isAxiosError(err) && err.response?.status === 404) {
+            throw new McpError(ErrorCode.InvalidParams, `Recipe with ID ${recipeId} not found.`);
+          }
+          throw apiError(`Failed to update recipe ID ${recipeId}`, err);
+        }
+      }
+
+      // --- delete_recipe ---
+      case "delete_recipe": {
+        const args = requireArgs(request.params.arguments);
+        const recipeId = requireNumber(args, 'recipe_id');
+
+        const url = `/api/recipe/${recipeId}/`;
+        console.error(`[API] DELETE ${url}`);
+        try {
+          const response = await apiClient.delete(url);
+          console.error(`[API] DELETE ${url} - Status: ${response.status}`);
+          return { content: [{ type: "text", text: `Successfully deleted recipe ID ${recipeId}.` }] };
+        } catch (err: any) {
+          console.error(`[Error] Failed to delete recipe ${recipeId}:`, err);
+          if (axios.isAxiosError(err) && err.response?.status === 404) {
+            throw new McpError(ErrorCode.InvalidParams, `Recipe with ID ${recipeId} not found.`);
+          }
+          throw apiError(`Failed to delete recipe ID ${recipeId}`, err);
+        }
+      }
+
+      // --- set_recipe_image ---
+      case "set_recipe_image": {
+        const args = requireArgs(request.params.arguments);
+        const recipeId = requireNumber(args, 'recipe_id');
+        const filePath = args.file_path as string | undefined;
+        const imageUrl = args.image_url as string | undefined;
+
+        if ((filePath && imageUrl) || (!filePath && !imageUrl)) {
+          throw new McpError(ErrorCode.InvalidParams, "Provide exactly one of file_path or image_url.");
+        }
+
+        const form = new FormData();
+        if (filePath) {
+          let fileBuffer: Buffer;
+          try {
+            fileBuffer = await readFile(filePath);
+          } catch (err: any) {
+            throw new McpError(ErrorCode.InvalidParams, `Could not read image file "${filePath}": ${err.message}`);
+          }
+          const fileName = basename(filePath);
+          const mimeType = IMAGE_MIME_TYPES[extname(filePath).toLowerCase()] || 'application/octet-stream';
+          form.append('image', new Blob([new Uint8Array(fileBuffer)], { type: mimeType }), fileName);
+          console.error(`[Info] Uploading ${fileBuffer.length} byte(s) from "${fileName}" as ${mimeType}`);
+        } else {
+          form.append('image_url', imageUrl as string);
+        }
+
+        const url = `/api/recipe/${recipeId}/image/`;
+        console.error(`[API] PUT ${url} - multipart/form-data (${filePath ? 'file upload' : 'image_url'})`);
+        try {
+          const response = await uploadClient.put(url, form);
+          console.error(`[API] PUT ${url} - Status: ${response.status}`);
+        } catch (err: any) {
+          console.error(`[Error] Failed to set image on recipe ${recipeId}:`, err);
+          if (axios.isAxiosError(err) && err.response?.status === 404) {
+            throw new McpError(ErrorCode.InvalidParams, `Recipe with ID ${recipeId} not found.`);
+          }
+          throw apiError(`Failed to set image on recipe ID ${recipeId}`, err);
+        }
+
+        // Tandoor catches UnidentifiedImageError, MissingSchema and bare
+        // Exception inside the image_url branch, prints them and carries on,
+        // returning 200 with no image attached. A 200 therefore proves nothing —
+        // read the recipe back and check.
+        console.error(`[API] GET /api/recipe/${recipeId}/ - Verifying image actually attached`);
+        let attachedImage: string | null = null;
+        try {
+          const verifyResponse = await apiClient.get(`/api/recipe/${recipeId}/`);
+          attachedImage = verifyResponse.data?.image ?? null;
+        } catch (err: any) {
+          console.error(`[Error] Failed to verify image on recipe ${recipeId}:`, err);
+          throw apiError(`Set image on recipe ID ${recipeId} but could not verify the result`, err);
+        }
+
+        if (!attachedImage) {
+          const failMsg = `Tandoor accepted the request but recipe ID ${recipeId} still has no image. ${imageUrl ? "Tandoor fetches image_url server-side through its SSRF guard and silently swallows fetch/decode failures — a private or LAN URL will fail this way. Try file_path instead." : "The uploaded file may not be a decodable image."}`;
+          console.error(`[Error] ${failMsg}`);
+          throw new McpError(ErrorCode.InternalError, failMsg);
+        }
+
+        const successMsg = `Successfully set image on recipe ID ${recipeId}. Image: ${attachedImage}`;
+        console.error(`[Info] ${successMsg}`);
+        return { content: [{ type: "text", text: successMsg }] };
+      }
+
+      // --- clear_recipe_image ---
+      case "clear_recipe_image": {
+        const args = requireArgs(request.params.arguments);
+        const recipeId = requireNumber(args, 'recipe_id');
+
+        // There is no DELETE for this endpoint. Tandoor clears the image when
+        // the PUT carries neither an 'image' file nor an 'image_url'.
+        const url = `/api/recipe/${recipeId}/image/`;
+        console.error(`[API] PUT ${url} - multipart/form-data (empty, clears the image)`);
+        try {
+          const response = await uploadClient.put(url, new FormData());
+          console.error(`[API] PUT ${url} - Status: ${response.status}`);
+        } catch (err: any) {
+          console.error(`[Error] Failed to clear image on recipe ${recipeId}:`, err);
+          if (axios.isAxiosError(err) && err.response?.status === 404) {
+            throw new McpError(ErrorCode.InvalidParams, `Recipe with ID ${recipeId} not found.`);
+          }
+          throw apiError(`Failed to clear image on recipe ID ${recipeId}`, err);
+        }
+
+        console.error(`[API] GET /api/recipe/${recipeId}/ - Verifying image actually cleared`);
+        try {
+          const verifyResponse = await apiClient.get(`/api/recipe/${recipeId}/`);
+          const remainingImage = verifyResponse.data?.image ?? null;
+          if (remainingImage) {
+            const failMsg = `Tandoor accepted the request but recipe ID ${recipeId} still has an image: ${remainingImage}`;
+            console.error(`[Error] ${failMsg}`);
+            throw new McpError(ErrorCode.InternalError, failMsg);
+          }
+        } catch (err: any) {
+          if (err instanceof McpError) throw err;
+          console.error(`[Error] Failed to verify image cleared on recipe ${recipeId}:`, err);
+          throw apiError(`Cleared image on recipe ID ${recipeId} but could not verify the result`, err);
+        }
+
+        const successMsg = `Successfully cleared the image on recipe ID ${recipeId}.`;
+        console.error(`[Info] ${successMsg}`);
+        return { content: [{ type: "text", text: successMsg }] };
+      }
+
+      // --- create_food ---
+      case "create_food": {
+        const args = requireArgs(request.params.arguments);
+        const name = requireString(args, 'name');
+        const parent = args.parent as number | undefined;
+
+        // Food.parent is read-only on the serializer, same as Keyword — create
+        // then move.
+        const payload = { name, ...collectOptional(args, ['plural_name', 'description']) };
+        console.error(`[API] POST /api/food/ - Payload: ${JSON.stringify(payload)}`);
+        let food: any;
+        try {
+          const response = await apiClient.post('/api/food/', payload);
+          console.error(`[API] POST /api/food/ - Status: ${response.status}`);
+          food = response.data;
+        } catch (err: any) {
+          console.error(`[Error] Failed to create food "${name}":`, err);
+          throw apiError(`Failed to create food "${name}"`, err);
+        }
+
+        let parentNote = '';
+        if (parent !== undefined) {
+          const moveUrl = `/api/food/${food.id}/move/${parent}/`;
+          console.error(`[API] PUT ${moveUrl} - Moving food under parent`);
+          try {
+            const moveResponse = await apiClient.put(moveUrl, {});
+            console.error(`[API] PUT ${moveUrl} - Status: ${moveResponse.status}`);
+            parentNote = ` and moved under parent food ID ${parent}`;
+          } catch (err: any) {
+            console.error(`[Error] Failed to move food ${food.id} under parent ${parent}:`, err);
+            throw apiError(`Created food ID ${food.id} but failed to move it under parent ${parent}`, err);
+          }
+        }
+
+        const successMsg = `Successfully created food "${food.name}" (ID: ${food.id})${parentNote}.`;
+        console.error(`[Info] ${successMsg}`);
+        return { content: [{ type: "text", text: successMsg }] };
+      }
+
+      // --- update_food ---
+      case "update_food": {
+        const args = requireArgs(request.params.arguments);
+        const foodId = requireNumber(args, 'food_id');
+        const payload = collectOptional(args, ['name', 'plural_name', 'description']);
+
+        if (Object.keys(payload).length === 0) {
+          throw new McpError(ErrorCode.InvalidParams, "No fields provided to update.");
+        }
+
+        const url = `/api/food/${foodId}/`;
+        console.error(`[API] PATCH ${url} - Payload: ${JSON.stringify(payload)}`);
+        try {
+          const response = await apiClient.patch(url, payload);
+          console.error(`[API] PATCH ${url} - Status: ${response.status}`);
+          return { content: [{ type: "text", text: `Successfully updated food ID ${foodId} (name: "${response.data.name}").` }] };
+        } catch (err: any) {
+          console.error(`[Error] Failed to update food ${foodId}:`, err);
+          if (axios.isAxiosError(err) && err.response?.status === 404) {
+            throw new McpError(ErrorCode.InvalidParams, `Food with ID ${foodId} not found.`);
+          }
+          throw apiError(`Failed to update food ID ${foodId}`, err);
+        }
+      }
+
+      // --- merge_food ---
+      case "merge_food": {
+        const args = requireArgs(request.params.arguments);
+        const foodId = requireNumber(args, 'food_id');
+        const targetFoodId = requireNumber(args, 'target_food_id');
+
+        if (foodId === targetFoodId) {
+          throw new McpError(ErrorCode.InvalidParams, "food_id and target_food_id must differ — Tandoor cannot merge a food with itself.");
+        }
+
+        // target is a path parameter; the request body is unused.
+        const url = `/api/food/${foodId}/merge/${targetFoodId}/`;
+        console.error(`[API] PUT ${url} - Merging food ${foodId} into ${targetFoodId}`);
+        try {
+          const response = await apiClient.put(url, {});
+          console.error(`[API] PUT ${url} - Status: ${response.status}`);
+          const detail = response.data?.msg ? ` ${response.data.msg}` : '';
+          return { content: [{ type: "text", text: `Successfully merged food ID ${foodId} into food ID ${targetFoodId}.${detail}` }] };
+        } catch (err: any) {
+          console.error(`[Error] Failed to merge food ${foodId} into ${targetFoodId}:`, err);
+          throw apiError(`Failed to merge food ID ${foodId} into ID ${targetFoodId}`, err);
+        }
+      }
+
+      // --- create_unit ---
+      case "create_unit": {
+        const args = requireArgs(request.params.arguments);
+        const name = requireString(args, 'name');
+        const payload = { name, ...collectOptional(args, ['plural_name', 'description', 'base_unit']) };
+
+        console.error(`[API] POST /api/unit/ - Payload: ${JSON.stringify(payload)}`);
+        try {
+          const response = await apiClient.post('/api/unit/', payload);
+          console.error(`[API] POST /api/unit/ - Status: ${response.status}`);
+          const successMsg = `Successfully created unit "${response.data.name}" (ID: ${response.data.id}).`;
+          console.error(`[Info] ${successMsg}`);
+          return { content: [{ type: "text", text: successMsg }] };
+        } catch (err: any) {
+          console.error(`[Error] Failed to create unit "${name}":`, err);
+          throw apiError(`Failed to create unit "${name}"`, err);
+        }
+      }
+
+      // --- update_unit ---
+      case "update_unit": {
+        const args = requireArgs(request.params.arguments);
+        const unitId = requireNumber(args, 'unit_id');
+        const payload = collectOptional(args, ['name', 'plural_name', 'description', 'base_unit']);
+
+        if (Object.keys(payload).length === 0) {
+          throw new McpError(ErrorCode.InvalidParams, "No fields provided to update.");
+        }
+
+        const url = `/api/unit/${unitId}/`;
+        console.error(`[API] PATCH ${url} - Payload: ${JSON.stringify(payload)}`);
+        try {
+          const response = await apiClient.patch(url, payload);
+          console.error(`[API] PATCH ${url} - Status: ${response.status}`);
+          return { content: [{ type: "text", text: `Successfully updated unit ID ${unitId} (name: "${response.data.name}").` }] };
+        } catch (err: any) {
+          console.error(`[Error] Failed to update unit ${unitId}:`, err);
+          if (axios.isAxiosError(err) && err.response?.status === 404) {
+            throw new McpError(ErrorCode.InvalidParams, `Unit with ID ${unitId} not found.`);
+          }
+          throw apiError(`Failed to update unit ID ${unitId}`, err);
+        }
+      }
+
+      // --- create_supermarket ---
+      case "create_supermarket": {
+        const args = requireArgs(request.params.arguments);
+        const name = requireString(args, 'name');
+        const payload = { name, ...collectOptional(args, ['description']) };
+
+        console.error(`[API] POST /api/supermarket/ - Payload: ${JSON.stringify(payload)}`);
+        try {
+          const response = await apiClient.post('/api/supermarket/', payload);
+          console.error(`[API] POST /api/supermarket/ - Status: ${response.status}`);
+          const successMsg = `Successfully created supermarket "${response.data.name}" (ID: ${response.data.id}).`;
+          console.error(`[Info] ${successMsg}`);
+          return { content: [{ type: "text", text: successMsg }] };
+        } catch (err: any) {
+          console.error(`[Error] Failed to create supermarket "${name}":`, err);
+          throw apiError(`Failed to create supermarket "${name}"`, err);
+        }
+      }
+
+      // --- create_supermarket_category ---
+      case "create_supermarket_category": {
+        const args = requireArgs(request.params.arguments);
+        const name = requireString(args, 'name');
+        const payload = { name, ...collectOptional(args, ['description']) };
+
+        console.error(`[API] POST /api/supermarket-category/ - Payload: ${JSON.stringify(payload)}`);
+        try {
+          const response = await apiClient.post('/api/supermarket-category/', payload);
+          console.error(`[API] POST /api/supermarket-category/ - Status: ${response.status}`);
+          const successMsg = `Successfully created supermarket category "${response.data.name}" (ID: ${response.data.id}).`;
+          console.error(`[Info] ${successMsg}`);
+          return { content: [{ type: "text", text: successMsg }] };
+        } catch (err: any) {
+          console.error(`[Error] Failed to create supermarket category "${name}":`, err);
+          throw apiError(`Failed to create supermarket category "${name}"`, err);
+        }
+      }
+
+      // --- delete_meal_plan_entry ---
+      case "delete_meal_plan_entry": {
+        const args = requireArgs(request.params.arguments);
+        const mealPlanId = requireNumber(args, 'meal_plan_id');
+
+        const url = `/api/meal-plan/${mealPlanId}/`;
+        console.error(`[API] DELETE ${url}`);
+        try {
+          const response = await apiClient.delete(url);
+          console.error(`[API] DELETE ${url} - Status: ${response.status}`);
+          return { content: [{ type: "text", text: `Successfully deleted meal plan entry ID ${mealPlanId}.` }] };
+        } catch (err: any) {
+          console.error(`[Error] Failed to delete meal plan entry ${mealPlanId}:`, err);
+          if (axios.isAxiosError(err) && err.response?.status === 404) {
+            throw new McpError(ErrorCode.InvalidParams, `Meal plan entry with ID ${mealPlanId} not found.`);
+          }
+          throw apiError(`Failed to delete meal plan entry ID ${mealPlanId}`, err);
+        }
+      }
+
+      // --- add_recipe_to_shopping_list ---
+      case "add_recipe_to_shopping_list": {
+        const args = requireArgs(request.params.arguments);
+        const recipeId = requireNumber(args, 'recipe_id');
+        const ingredientIds = args.ingredient_ids as number[] | undefined;
+
+        if (ingredientIds !== undefined && !Array.isArray(ingredientIds)) {
+          throw new McpError(ErrorCode.InvalidParams, "ingredient_ids must be an array of ingredient IDs.");
+        }
+
+        // Tandoor adds every ingredient when 'ingredients' is absent, so it is
+        // only sent when the caller narrowed the selection.
+        const payload: Record<string, any> = collectOptional(args, ['servings', 'list_recipe']);
+        if (ingredientIds !== undefined) {
+          payload.ingredients = ingredientIds;
+        }
+
+        const url = `/api/recipe/${recipeId}/shopping/`;
+        console.error(`[API] PUT ${url} - Payload: ${JSON.stringify(payload)}`);
+        try {
+          const response = await apiClient.put(url, payload);
+          console.error(`[API] PUT ${url} - Status: ${response.status}`);
+          const detail = response.data?.msg || `Recipe ID ${recipeId} was added to the shopping list.`;
+          console.error(`[Info] ${detail}`);
+          return { content: [{ type: "text", text: detail }] };
+        } catch (err: any) {
+          console.error(`[Error] Failed to add recipe ${recipeId} to the shopping list:`, err);
+          if (axios.isAxiosError(err) && err.response?.status === 404) {
+            throw new McpError(ErrorCode.InvalidParams, `Recipe with ID ${recipeId} not found.`);
+          }
+          throw apiError(`Failed to add recipe ID ${recipeId} to the shopping list`, err);
         }
       }
 
