@@ -42,7 +42,10 @@ interface TandoorUnitInput {
 
 interface TandoorIngredientInput {
   food: TandoorFoodInput | null;
-  unit?: TandoorUnitInput; // omitted entirely when the line named no unit
+  // Tandoor's Ingredient serializer requires the unit key to be PRESENT but
+  // allows it to be null; omitting it entirely fails with
+  // {"unit":["This field is required."]}. null is how "no unit" is represented.
+  unit: TandoorUnitInput | null;
   amount: number;
   note?: string;
 }
@@ -659,16 +662,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             // Never fall back to the raw line. A null food is real data (a line
             // that parses to nothing but a note); a line-as-food-name is not.
             food: parsed.food ? { id: parsed.food.id, name: parsed.food.name } : null,
+            // Send null when the line named no unit. A missing unit is correct
+            // data, a fabricated one is not — the previous code substituted a
+            // unit literally named "unit" here.
+            unit: parsed.unit ? { id: parsed.unit.id, name: parsed.unit.name } : null,
             // Tandoor represents "no amount given" as 0 and Ingredient.amount is
             // non-nullable, so pass the parser's value straight through rather
             // than defaulting to 1.
             amount: parsed.amount ?? 0,
           };
-          // Omit unit entirely when the line named none — a missing unit is
-          // correct data, a fabricated one is not.
-          if (parsed.unit) {
-            ingredient.unit = { id: parsed.unit.id, name: parsed.unit.name };
-          }
           const note = parsed.note?.trim();
           if (note) {
             ingredient.note = note;
