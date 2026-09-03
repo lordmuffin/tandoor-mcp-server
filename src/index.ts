@@ -177,6 +177,13 @@ const IMAGE_MIME_TYPES: Record<string, string> = {
   '.tiff': 'image/tiff',
 };
 
+// Shared by set_recipe_image's file_path and file_base64 branches: appends an
+// image buffer to a multipart form under the 'image' field Tandoor expects.
+function appendImageBuffer(form: FormData, buffer: Buffer, fileName: string, mimeType: string): void {
+  form.append('image', new Blob([new Uint8Array(buffer)], { type: mimeType }), fileName);
+  console.error(`[Info] Uploading ${buffer.length} byte(s) from "${fileName}" as ${mimeType}`);
+}
+
 // --- MCP Server Setup ---
 const server = new Server(
   {
@@ -450,13 +457,15 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "set_recipe_image",
-        description: "Set a recipe's image. Provide EXACTLY ONE of file_path (a local image file, uploaded as multipart/form-data) or image_url. Note that image_url is fetched by the Tandoor server itself through its SSRF guard, which refuses private/LAN addresses — use it only for public URLs, and prefer file_path. Tandoor silently swallows image errors and still answers 200, so this tool re-reads the recipe afterwards and reports an error if no image actually attached.",
+        description: "Set a recipe's image. Provide EXACTLY ONE of file_path (a local image file on this server's own disk, uploaded as multipart/form-data), image_url, or file_base64 (raw image bytes, base64-encoded, for a caller with no shared filesystem access to this server). Note that image_url is fetched by the Tandoor server itself through its SSRF guard, which refuses private/LAN addresses — use it only for public URLs. Tandoor silently swallows image errors and still answers 200, so this tool re-reads the recipe afterwards and reports an error if no image actually attached.",
         inputSchema: {
           type: "object",
           properties: {
             recipe_id: { type: "integer", description: "The ID of the recipe." },
-            file_path: { type: "string", description: "Path to a local image file to upload." },
-            image_url: { type: "string", description: "Public URL for Tandoor to fetch. Private/LAN addresses are refused by Tandoor's SSRF guard." }
+            file_path: { type: "string", description: "Path to a local image file to upload, on this MCP server's own filesystem." },
+            image_url: { type: "string", description: "Public URL for Tandoor to fetch. Private/LAN addresses are refused by Tandoor's SSRF guard." },
+            file_base64: { type: "string", description: "Base64-encoded raw image bytes to upload directly, for callers that can't place a file on this server's disk or reach it via a public URL." },
+            mime_type: { type: "string", description: "MIME type of the file_base64 image data, e.g. \"image/jpeg\". Only used with file_base64; ignored otherwise. Defaults to \"image/png\". Tandoor validates the actual image bytes regardless of this value, so a wrong mime_type only risks a cosmetically wrong file extension on Tandoor's side, not a failed upload." }
           },
           required: ["recipe_id"]
         },
@@ -1494,9 +1503,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const recipeId = requireNumber(args, 'recipe_id');
         const filePath = args.file_path as string | undefined;
         const imageUrl = args.image_url as string | undefined;
+        const fileBase64 = args.file_base64 as string | undefined;
 
-        if ((filePath && imageUrl) || (!filePath && !imageUrl)) {
-          throw new McpError(ErrorCode.InvalidParams, "Provide exactly one of file_path or image_url.");
+        const providedCount = [filePath, imageUrl, fileBase64].filter((v) => v !== undefined).length;
+        if (providedCount !== 1) {
+          throw new McpError(ErrorCode.InvalidParams, "Provide exactly one of file_path, image_url, or file_base64.");
         }
 
         const form = new FormData();
@@ -1509,8 +1520,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
           const fileName = basename(filePath);
           const mimeType = IMAGE_MIME_TYPES[extname(filePath).toLowerCase()] || 'application/octet-stream';
-          form.append('image', new Blob([new Uint8Array(fileBuffer)], { type: mimeType }), fileName);
-          console.error(`[Info] Uploading ${fileBuffer.length} byte(s) from "${fileName}" as ${mimeType}`);
+          appendImageBuffer(form, fileBuffer, fileName, mimeType);
+        } else if (fileBase64) {
+          let fileBuffer: Buffer;
+          try {
+            fileBuffer = Buffer.from(fileBase64, 'base64');
+          } catch (err: any) {
+            throw new McpError(ErrorCode.InvalidParams, `Could not decode file_base64: ${err.message}`);
+          }
+          if (fileBuffer.length === 0) {
+            throw new McpError(ErrorCode.InvalidParams, "file_base64 decoded to zero bytes.");
+          }
+          const mimeType = (args.mime_type as string | undefined) || 'image/png';
+          const extension = Object.entries(IMAGE_MIME_TYPES).find(([, mt]) => mt === mimeType)?.[0] || '.png';
+          appendImageBuffer(form, fileBuffer, `upload${extension}`, mimeType);
         } else {
           form.append('image_url', imageUrl as string);
         }
