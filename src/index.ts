@@ -1505,7 +1505,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const imageUrl = args.image_url as string | undefined;
         const fileBase64 = args.file_base64 as string | undefined;
 
-        const providedCount = [filePath, imageUrl, fileBase64].filter((v) => v !== undefined).length;
+        // Truthy, not `!== undefined`: some MCP transports normalise an
+        // omitted optional argument to an explicit `null` rather than
+        // dropping the key, and `null !== undefined` would miscount it as
+        // "provided".
+        const providedCount = [filePath, imageUrl, fileBase64].filter((v) => !!v).length;
         if (providedCount !== 1) {
           throw new McpError(ErrorCode.InvalidParams, "Provide exactly one of file_path, image_url, or file_base64.");
         }
